@@ -1,0 +1,100 @@
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${DB_NAME:-stock_portefolio_builder}
+      MYSQL_USER: ${DB_USER:-stock_user}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-stock_pass}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql-init/01-import-schema-or-backup.sh:/docker-entrypoint-initdb.d/01-import-schema-or-backup.sh:ro
+      - ./:/seed-repo:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_ROOT_PASSWORD:-rootpassword}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_USER: ${DB_USER:-stock_user}
+      DB_PASSWORD: ${DB_PASSWORD:-stock_pass}
+      DB_NAME: ${DB_NAME:-stock_portefolio_builder}
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+
+  ml:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml.gpu
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_USER: ${DB_USER:-stock_user}
+      DB_PASSWORD: ${DB_PASSWORD:-stock_pass}
+      DB_NAME: ${DB_NAME:-stock_portefolio_builder}
+    volumes:
+      - ./:/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+# Notes:
+#   - Do NOT run heavy manual training in the `ml` service while a scheduler
+#     cycle is training: both would compete for the same GPU. Check what the
+#     scheduler is doing first:  docker compose logs -f ml-scheduler
+#   - Tune the cadence via the SCHEDULER_* environment variables below.
+#   - MAX_STOCKS_PER_CYCLE=25 spreads the initial full-retrain backlog across
+#     cycles instead of one multi-day marathon. Once the backlog is cleared,
+#     raise it or remove it.
+ 
+  ml-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml.gpu
+    restart: unless-stopped
+    command: python ml_scheduler.py
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_USER: ${DB_USER:-stock_user}
+      DB_PASSWORD: ${DB_PASSWORD:-stock_pass}
+      DB_NAME: ${DB_NAME:-stock_portefolio_builder}
+      SCHEDULER_INTERVAL_HOURS: "6"
+      TRAIN_MAX_AGE_DAYS: "30"
+      PREDICT_MAX_AGE_DAYS: "1"
+      MAX_STOCKS_PER_CYCLE: "25"
+      SCHEDULER_RUN_ON_START: "true"
+    volumes:
+      - ./:/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+volumes:
+  mysql_data:

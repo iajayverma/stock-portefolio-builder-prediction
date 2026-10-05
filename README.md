@@ -1,0 +1,427 @@
+# Stock Portefolio Builder Prediction
+
+A comprehensive stock data pipeline and machine learning system for fetching financial data, calculating metrics, and predicting stock prices.
+
+## Features
+
+- **Automated Data Fetching**: Dynamically fetches index constituents from Wikipedia (S&P 500, C25, etc.)
+- **TTM Financial Calculations**: Trailing Twelve Months metrics from quarterly reports
+- **Blacklist Management**: Automatic handling of delisted/invalid tickers
+- **ML Price Prediction**: LSTM, Random Forest, and XGBoost models for price forecasting
+- **Database Storage**: MySQL database for persistent data storage
+
+## Prerequisites
+
+- Python 3.12
+- Docker Desktop with WSL2 backend or Docker Engine
+- NVIDIA GPU support for the ML container
+- Database credentials configured in `dev.env`
+
+## Python Environment
+
+This project now targets Python 3.12 everywhere, with a split between the base
+application runtime and the ML runtime overlay.
+
+### Python 3.12 (Recommended)
+
+Use this environment for the **data pipeline, portfolio construction, Streamlit UI, and general usage**. It includes:
+
+- **Data & Visualization**: pandas, numpy, matplotlib, scipy, scikit-learn, plotly
+- **Financial Data**: yfinance, pandas-ta, lxml
+- **Web UI**: Streamlit
+- **Database**: SQLAlchemy, mysql-connector-python
+
+Install `requirements_PY_3_12.txt` for the base app runtime.
+
+### Python 3.12 ML Overlay
+
+Use `requirements_PY_3_12_ml.txt` when you need **TensorFlow 2.21**, **Keras Tuner**,
+and **XGBoost** for `model_trainer.py` and `price_predictor.py`.
+
+For Windows hosts, GPU-backed ML must run through **Docker Desktop + WSL2** with
+NVIDIA GPU passthrough enabled.
+
+## Installation
+
+1. Clone or download the repository to your local machine.
+
+2. Create a virtual environment (optional for non-Docker workflows):
+
+ **Base runtime:**
+    ```bash
+    conda create -n stock_env python=3.12
+    conda activate stock_env
+    pip install -r requirements_PY_3_12.txt
+    ```
+
+ **ML runtime overlay:**
+    ```bash
+    conda activate stock_env
+    pip install -r requirements_PY_3_12_ml.txt
+    ```
+
+3. Configure database credentials in `dev.env`:
+    ```
+    DB_HOST=db
+    DB_USER=your_user
+    DB_PASSWORD=your_password
+    DB_NAME=your_database
+    DB_ROOT_PASSWORD=your_root_password
+    ```
+
+Keep `DB_HOST=db` for containerized runs (`docker compose exec...`).
+For host-local runs (`python stock_orchestrator.py` from your terminal), set
+`DB_HOST=127.0.0.1` (or `localhost`) so MySQL resolves outside Docker networking.
+
+4. Start the Docker environment:
+    ```bash
+    docker compose --env-file dev.env up -d db app ml
+    ```
+
+ - The `db` container initializes MySQL from `database_backup.sql` when that file
+ exists in the repository root.
+ - If no backup file is present, the container falls back to `database_files/ddl.sql`.
+ - On Windows, ensure Docker Desktop uses the **WSL2 backend** and that GPU support
+ is enabled before starting the `ml` service.
+
+## Usage
+
+### Docker-first Commands
+
+```bash
+# Start the stack
+docker compose --env-file dev.env up -d db app ml
+
+# Fetch or update stock data
+docker compose exec app python stock_orchestrator.py --workers 2
+
+# Train GPU-backed ML models
+docker compose exec ml python model_trainer.py
+
+# Generate predictions
+docker compose exec ml python price_predictor.py
+
+# Build the portfolio
+docker compose exec app python portfolio_builder.py
+```
+
+### Manual Stock Data Updates Against The Docker DB
+
+If the MySQL database is running in Docker, the simplest manual path is to run the orchestrator inside the `app` container so `DB_HOST=db` keeps working:
+
+```bash
+# Start or refresh the app + DB services
+docker compose --env-file dev.env up -d db app
+
+# Update all tracked tickers incrementally
+docker compose exec app python stock_orchestrator.py --workers 2
+
+# Update only the tickers already stored in the Docker-hosted DB
+docker compose exec app python stock_orchestrator.py --update-only --workers 2
+
+# Update specific tickers
+docker compose exec app python stock_orchestrator.py --ticker AAPL MSFT NOVO-B.CO --workers 2
+```
+
+If you prefer to run from the Windows host instead, point `dev.env` at the published MySQL port first:
+
+```powershell
+$env:DB_HOST = "127.0.0.1"
+.venv\Scripts\python.exe stock_orchestrator.py --update-only --workers 2
+```
+
+For host-local runs, keep Docker publishing port `3306` and make sure the local Python environment was installed from `requirements_PY_3_12.txt`.
+
+### Fetching Stock Data (Recommended)
+
+Use the Stock Data Orchestrator to fetch and update all stock data:
+
+```python
+from stock_orchestrator import StockDataOrchestrator
+
+# Initialize with default indices (S&P 500 + C25)
+orchestrator = StockDataOrchestrator()
+
+# Run the full data pipeline
+stats = orchestrator.run()
+
+# Or run for specific indices
+orchestrator = StockDataOrchestrator(indices=['SP500'])
+stats = orchestrator.run()
+```
+
+**Command line:**
+```bash
+python stock_orchestrator.py
+```
+
+### Programmatic Usage
+
+```python
+from stock_orchestrator import run_with_indices
+
+# Fetch data for specific indices
+stats = run_with_indices(['SP500', 'C25'], prefer_ttm=True)
+```
+
+### Building ML Models
+
+```python
+from ml_builder import train_and_validate_models
+
+# Train models for a specific stock
+# (Data is fetched from the database)
+results = train_and_validate_models(
+    stock_symbol='AAPL',
+    # ... other parameters
+)
+```
+
+### Generating Predictions
+
+```python
+from price_predictor import run_predictions
+
+summary = run_predictions(max_prediction_age_days=1, investment_years=7)
+```
+
+`price_predictor.py` is cache-first: it rebuilds models only from valid cached hyperparameters.
+If any required cache entry is missing, stale, or invalid, the ticker returns an explicit status such
+as `training_required` or `cache_invalidated` and prediction stops for that ticker instead of tuning
+models inside the prediction phase. Run `model_trainer.py` first to refresh missing caches.
+
+If cached flat-model rows (`rf`, `xgb`, `ridge`, `svr`) need to be reconciled after a preprocessing
+contract change, use the supported admin command instead of an ad hoc script:
+
+```bash
+python model_trainer.py --refresh-cache-contract APP ASML.AS
+```
+
+To refresh only a subset of flat-model caches and then verify each ticker can still predict from
+cache-only state, run:
+
+```bash
+python model_trainer.py --refresh-cache-contract APP ASML.AS --refresh-model-types ridge svr --validate-prediction
+```
+
+### Auditing And Repair Planning
+
+Run the stock-data validation first:
+
+```bash
+python validate_stock_data.py
+```
+
+Then build repair cohorts from the generated validation report:
+
+```bash
+python repair_cohort_planner.py --report data_validation_report.json
+```
+
+This writes `repair_cohorts.json` and `repair_cohort_summary.txt`, which separate safe ticker-scoped
+repair cohorts such as stale prices, missing quarterly data, and ratio lag from spike findings that
+should be manually reviewed before any destructive cleanup.
+
+Build the executable repair queue in dry-run mode with:
+
+```bash
+python repair_ticker_cohorts.py --plan repair_cohorts.json
+```
+
+After reviewing the queue, execute only the safe cohorts with:
+
+```bash
+python repair_ticker_cohorts.py --plan repair_cohorts.json --execute
+```
+
+This writes `repair_execution_report.json` and `repair_execution_summary.txt` so each repair run leaves
+an auditable record of which ticker-scoped actions were planned or executed.
+
+## Project Structure
+
+| File | Description |
+| `stock_orchestrator.py` | Main entry point - orchestrates the complete data pipeline |
+| `dynamic_index_fetcher.py` | Fetches index constituents from Wikipedia |
+| `enhanced_financial_fetcher.py` | Fetches quarterly financial data with TTM calculations |
+| `ttm_financial_calculator.py` | TTM calculations and ratio computations |
+| `db_interactions.py` | Database import/export operations |
+| `blacklist_manager.py` | Manages blacklisted (delisted/invalid) tickers |
+| `ml_builder.py` | Machine learning model training and prediction |
+| `stock_data_fetch.py` | Core data fetching utilities |
+
+## Data Pipeline Flow
+
+1. **Get Symbols**: Fetch index constituents from Wikipedia (cached monthly)
+2. **Filter Blacklist**: Remove delisted/invalid tickers
+3. **Fetch Stock Info**: Basic company information
+4. **Fetch Price Data**: Historical OHLCV data
+5. **Fetch Financial Data**: Income statement, balance sheet, cash flow
+6. **Fetch Quarterly Data**: Quarterly reports for TTM calculations
+7. **Calculate Ratios**: P/E, P/B, P/S, P/FCF using TTM when available
+
+## Blacklist Management
+
+Tickers are automatically blacklisted when:
+- Symbol is delisted or not found
+- No data available from data sources
+- Repeated fetch errors
+
+Blacklisted tickers are stored in `blacklisted_tickers.json` and filtered from future fetches.
+
+## Configuration
+
+### Supported Indices
+
+- `SP500` - S&P 500 (US)
+- `C25` - OMX Copenhagen 25 (Denmark)
+- Market indices: `^VIX`, `^GSPC`, `^IXIC`, `^DJI`, etc.
+
+### Environment Variables
+
+Configure in `dev.env`:
+- `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` - Database credentials
+- `DB_ROOT_PASSWORD` - root password used by the Dockerized MySQL service
+
+## Development And Maintenance
+
+### Repository Layout For Development
+
+| Directory | Contents |
+| `tests/` | The real test suites: `unit/`, `integration/`, `e2e/`, `performance/`, `security/`, `data_validation/` plus shared config (`test_config.yaml`) |
+| `scripts/` | One-off diagnostic and maintenance scripts (hit the live DB or yfinance — tools, not tests) |
+| `docs/history/` | Historical fix and status reports, kept for reference |
+
+### Running The Tests
+
+Run from the repo root with the `fetch_Stock_data_3_12` environment activated
+(or any environment installed from `requirements_PY_3_12.txt` plus `pytest`).
+
+```bash
+# Full unit suite (fast, no database or GPU needed — such tests skip themselves)
+pytest tests/unit
+
+# Verbose: one line per test
+pytest tests/unit -v
+
+# Verbose + show WHY skipped tests were skipped
+pytest tests/unit -v -rs
+
+# A single test file
+pytest tests/unit/test_split_dataset_target_alignment.py
+
+# A single test by name
+pytest tests/unit -k "test_target_is_next_day_return"
+```
+
+Run the unit suite locally before every push. The integration, e2e, and
+performance suites need the Dockerized MySQL running and take much longer:
+
+```bash
+docker compose --env-file dev.env up -d db
+pytest tests/integration
+pytest tests/e2e
+```
+
+The target-alignment tests in `tests/unit/test_split_dataset_target_alignment.py`
+are a leakage guard: they verify the ML prediction target is the *next* day's
+close-to-close return and never a same-row or past value. If a change to
+`split_dataset.py`, `stock_data_fetch.py`, or `technical_indicators.py` makes
+these fail, the change has reintroduced target leakage — fix the change, do
+not adjust the tests.
+
+### Linting
+
+CI enforces a minimum pylint score (see `PYLINT_THRESHOLD` in
+`.github/workflows/ci.yml`). Check your score locally before pushing:
+
+```bash
+# Git Bash / Anaconda Prompt (cmd):
+git ls-files *.py > pyfiles.txt
+python -m pylint @pyfiles.txt
+rm pyfiles.txt
+
+# PowerShell:
+python -m pylint (git ls-files '*.py')
+```
+
+The last output line shows the score. The threshold is a ratchet: after a
+cleanup pass raises the score, bump `PYLINT_THRESHOLD` up to just below the
+new score in `ci.yml` to lock in the gain. Never lower it to make a failing
+build pass — fix the findings instead.
+
+### Continuous Integration
+
+Every push and pull request runs `.github/workflows/ci.yml` with two parallel jobs:
+
+- **lint** — pylint over the application code (tests excluded), failing below `PYLINT_THRESHOLD`
+- **tests** — `pytest tests/unit`; DB- and GPU-dependent tests skip automatically since CI has neither
+
+Check results in the repository's **Actions** tab on GitHub. A red X on either
+job blocks the change until fixed.
+
+### Recurring Maintenance Tasks
+
+**Updating stock data** (run regularly, e.g. after market close or weekly):
+
+```bash
+docker compose --env-file dev.env up -d db app
+docker compose exec app python stock_orchestrator.py --update-only --workers 2
+```
+
+**Retraining models** — `model_trainer.py` retrains models older than
+`--max-age` days (default 30), so a periodic run only retrains what is stale:
+
+```bash
+# Routine: retrain anything older than 30 days
+docker compose exec ml python model_trainer.py
+
+# Force full retraining regardless of model age
+docker compose exec ml python model_trainer.py --max-age 0
+
+# Limit a run to the first N stocks (useful for testing changes)
+docker compose exec ml python model_trainer.py --max-age 0 --max-stocks 2
+```
+
+**Data quality audit and repair** (run when results look off, or monthly):
+follow the Auditing And Repair Planning section above — `validate_stock_data.py`,
+then `repair_cohort_planner.py`, then `repair_ticker_cohorts.py` (dry-run
+before `--execute`).
+
+**After changing `requirements_PY_3_12*.txt`**, rebuild the images so the
+containers match the files:
+
+```bash
+docker compose --env-file dev.env build app ml
+docker compose --env-file dev.env up -d db app ml
+```
+
+### After Changing Preprocessing, Features, Or The Target
+
+Cached hyperparameters and flat-model rows (`rf`, `xgb`, `ridge`, `svr`) were
+tuned against the *previous* data contract and are invalid after such a change.
+Either force a full retrain (`model_trainer.py --max-age 0`) or reconcile the
+caches per ticker:
+
+```bash
+python model_trainer.py --refresh-cache-contract APP ASML.AS --validate-prediction
+```
+
+Note that model metrics from before and after a target or feature change are
+**not comparable** — they measure performance against different prediction
+tasks. After the 2026 target-leakage fix in `split_dataset.py`, expect metrics
+to be visibly worse than historical numbers; the old numbers were inflated by
+leakage and the new ones are the honest baseline going forward.
+
+## License
+
+See LICENSE file for details.
+
+## Repository Maintainer
+
+Ajay Verma
+
+## Attribution
+
+This repository is based on an open-source project distributed under its original license. The original work is by the authors of Joerndm/stock_portefolio_builder.
+
+All original copyright notices and the LICENSE file are preserved. This copy adds only repository-level metadata; the source code remains the work of the original authors.

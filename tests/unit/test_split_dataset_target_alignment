@@ -1,0 +1,285 @@
+"""
+Unit tests for split_dataset.dataset_train_test_split target alignment.
+
+These tests guard against target leakage in the train/val/test split:
+
+1. The prediction target must be the NEXT day's close-to-close return
+   (forward-shifted), never a same-row or past value.
+2. No feature column may be (near-)perfectly correlated with the target,
+   which would indicate the target is reconstructable from the features.
+3. The split must be chronological, and unsorted input must be rejected.
+4. Output shapes must be consistent with the documented split fractions.
+
+Regression context: an earlier implementation assigned the stored "1D"
+column (a *lagged* return) as the target without a forward shift, which
+asked the model to reconstruct a past value already embedded in the
+features (SMAs/EMAs contain close(t-1)). That inflated test metrics while
+making live forecasts meaningless. These tests fail on that implementation.
+"""
+import os
+import sys
+import unittest
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
+import split_dataset  # noqa: E402  (path insert must come first)
+
+
+def _make_synthetic_dataset(n_rows=200, seed=7):
+    """Build a minimal but realistic ascending-date stock dataframe."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2022-01-03", periods=n_rows)
+    # Random-walk close prices, strictly positive
+    returns = rng.normal(loc=0.0005, scale=0.015, size=n_rows)
+    close = 100.0 * np.cumprod(1.0 + returns)
+
+    df = pd.DataFrame({
+        "date": dates,
+        "ticker": ["TEST.CO"] * n_rows,
+        "currency": ["DKK"] * n_rows,
+        "open_Price": close * (1 + rng.normal(0, 0.002, n_rows)),
+        "high_Price": close * (1 + np.abs(rng.normal(0, 0.004, n_rows))),
+        "low_Price": close * (1 - np.abs(rng.normal(0, 0.004, n_rows))),
+        "close_Price": close,
+        "trade_Volume": rng.integers(10_000, 500_000, n_rows).astype(float),
+    })
+
+    # Lagged 1D return column, matching how stock_data_fetch stores it:
+    # pct_change(1) shifted +1 (row t holds the return that ended at t-1).
+    df["1D"] = df["close_Price"].pct_change(1).shift(1)
+
+    # A few plausible feature columns computed from prices up to day t
+    df["sma_5"] = df["close_Price"].rolling(5).mean()
+    df["sma_20"] = df["close_Price"].rolling(20).mean()
+    df["rsi_14"] = 50 + rng.normal(0, 10, n_rows)  # placeholder indicator
+    df["pe_ratio"] = 15 + rng.normal(0, 2, n_rows)
+
+    # The splitter expects a cleaned dataframe (no NaNs in features)
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+
+class TestTargetAlignment(unittest.TestCase):
+    """The target must be the forward-shifted next-day return."""
+
+    def setUp(self):
+        self.df = _make_synthetic_dataset()
+
+    def _run_split(self, df):
+        return split_dataset.dataset_train_test_split(
+            df.copy(), test_size=0.10, validation_size=0.20
+        )
+
+    def test_target_is_next_day_return(self):
+        """y_train (inverse-scaled) must equal close(t+1)/close(t) - 1."""
+        (scaler_x, scaler_y, x_train, x_val, x_test,
+         y_train, y_val, y_test, x_predictions) = self._run_split(self.df)
+
+        # Reconstruct the expected target from the raw close prices
+        close = self.df["close_Price"].reset_index(drop=True)
+        expected_target = (close.shift(-1) / close - 1.0)
+
+        y_train_unscaled = scaler_y.inverse_transform(
+            np.asarray(y_train).reshape(-1, 1)
+        ).flatten()
+
+        n_train = len(y_train_unscaled)
+        np.testing.assert_allclose(
+            y_train_unscaled,
+            expected_target.iloc[:n_train].values,
+            rtol=1e-9, atol=1e-12,
+            err_msg=(
+                "Training target is not the next-day return. "
+                "The target must be close(t+1)/close(t) - 1, i.e. strictly "
+                "in the future relative to the features in row t."
+            ),
+        )
+
+    def test_target_is_not_the_lagged_1d_column(self):
+        """Regression: the target must NOT be the stored (lagged) 1D column."""
+        (scaler_x, scaler_y, x_train, x_val, x_test,
+         y_train, y_val, y_test, x_predictions) = self._run_split(self.df)
+        y_train_unscaled = scaler_y.inverse_transform(
+            np.asarray(y_train).reshape(-1, 1)
+        ).flatten()
+
+        lagged_1d = self.df["1D"].reset_index(drop=True)
+        n_train = len(y_train_unscaled)
+        # If the target were the lagged 1D column, these would match exactly.
+        self.assertFalse(
+            np.allclose(y_train_unscaled, lagged_1d.iloc[:n_train].values),
+            "Target equals the lagged '1D' column — this is the old "
+            "leaky construction (predicting a past value).",
+        )
+
+    def test_no_feature_perfectly_correlated_with_target(self):
+        """No feature column may be ~perfectly correlated with the target."""
+        (scaler_x, scaler_y, x_train, x_val, x_test,
+         y_train, y_val, y_test, x_predictions) = self._run_split(self.df)
+
+        y_train_unscaled = scaler_y.inverse_transform(
+            np.asarray(y_train).reshape(-1, 1)
+        ).flatten()
+
+        x_train_df = pd.DataFrame(np.asarray(x_train))
+        for col in x_train_df.columns:
+            feature = x_train_df[col].values
+            if np.std(feature) == 0:
+                continue
+            corr = abs(np.corrcoef(feature, y_train_unscaled)[0, 1])
+            self.assertLess(
+                corr, 0.999,
+                f"Feature column index {col} correlates {corr:.6f} with the "
+                "target — likely target leakage.",
+            )
+
+
+class TestHorizonParameterization(unittest.TestCase):
+    """The horizon argument and TARGET_HORIZON_DAYS env var control the
+    forward-return window: prediction(t) = close(t+h)/close(t) - 1."""
+
+    def setUp(self):
+        self.df = _make_synthetic_dataset()
+        os.environ.pop("TARGET_HORIZON_DAYS", None)
+
+    def tearDown(self):
+        os.environ.pop("TARGET_HORIZON_DAYS", None)
+
+    def _expected_target(self, h):
+        close = self.df["close_Price"].reset_index(drop=True)
+        return close.pct_change(h).shift(-h)
+
+    def _unscaled_y_train(self, **kwargs):
+        (scaler_x, scaler_y, x_train, x_val, x_test,
+         y_train, y_val, y_test, x_predictions) = \
+            split_dataset.dataset_train_test_split(self.df.copy(), **kwargs)
+        return scaler_y.inverse_transform(
+            np.asarray(y_train).reshape(-1, 1)
+        ).flatten()
+
+    def test_explicit_horizon_five(self):
+        y = self._unscaled_y_train(horizon=5)
+        expected = self._expected_target(5)
+        np.testing.assert_allclose(
+            y, expected.iloc[:len(y)].values, rtol=1e-9, atol=1e-12,
+            err_msg="horizon=5 target must be the 5-day forward return "
+                    "close(t+5)/close(t) - 1",
+        )
+
+    def test_env_var_horizon(self):
+        os.environ["TARGET_HORIZON_DAYS"] = "10"
+        y = self._unscaled_y_train()  # no explicit arg -> env var applies
+        expected = self._expected_target(10)
+        np.testing.assert_allclose(
+            y, expected.iloc[:len(y)].values, rtol=1e-9, atol=1e-12,
+            err_msg="TARGET_HORIZON_DAYS=10 must produce the 10-day forward return",
+        )
+
+    def test_explicit_horizon_overrides_env(self):
+        os.environ["TARGET_HORIZON_DAYS"] = "10"
+        y = self._unscaled_y_train(horizon=1)
+        expected = self._expected_target(1)
+        np.testing.assert_allclose(
+            y, expected.iloc[:len(y)].values, rtol=1e-9, atol=1e-12,
+            err_msg="Explicit horizon argument must override the env var",
+        )
+
+    def test_default_is_horizon_one(self):
+        y_default = self._unscaled_y_train()
+        expected = self._expected_target(1)
+        np.testing.assert_allclose(
+            y_default, expected.iloc[:len(y_default)].values,
+            rtol=1e-9, atol=1e-12,
+            err_msg="Default (no arg, no env var) must be next-day return",
+        )
+
+    def test_invalid_horizon_rejected(self):
+        with self.assertRaises(ValueError):
+            split_dataset.dataset_train_test_split(self.df.copy(), horizon=0)
+        with self.assertRaises(ValueError):
+            split_dataset.dataset_train_test_split(self.df.copy(), horizon=-3)
+
+    def test_embargo_removes_boundary_rows(self):
+        """horizon-1 rows must be dropped at train/val and val/test
+        boundaries; horizon=1 must leave split sizes unchanged."""
+        def split_sizes(**kwargs):
+            (sx, sy, x_train, x_val, x_test, *_u) = \
+                split_dataset.dataset_train_test_split(self.df.copy(), **kwargs)
+            return len(x_train), len(x_val), len(x_test)
+
+        n_input = len(self.df)
+        forecast_out = int(np.ceil(0.05 * n_input))
+
+        def usable_rows(h):
+            # Rows after reserving forecast_out and dropping NaN targets:
+            # the last h rows of the full frame lack a forward return; the
+            # forecast_out slice already removes min(h, forecast_out) of them.
+            return (n_input - forecast_out) - max(h - forecast_out, 0)
+
+        # h=1: no embargo — every usable row lands in exactly one subset
+        tr1, va1, te1 = split_sizes(horizon=1)
+        self.assertEqual(tr1 + va1 + te1, usable_rows(1))
+
+        # h=10: two embargoes of h-1 rows each are removed at the boundaries
+        h = 10
+        tr, va, te = split_sizes(horizon=h)
+        self.assertEqual(
+            tr + va + te, usable_rows(h) - 2 * (h - 1),
+            "train+val+test must equal usable rows minus two embargoes",
+        )
+        # Embargo trims train and val; test only shifts by the NaN-tail
+        # difference between horizons, never by the embargo itself.
+        self.assertLess(tr, tr1, "train must shrink under embargo")
+        self.assertLess(va, va1, "val must shrink under embargo")
+
+
+class TestChronologyAndShapes(unittest.TestCase):
+    """Chronological ordering is enforced; shapes follow the split fractions."""
+
+    def setUp(self):
+        self.df = _make_synthetic_dataset()
+
+    def test_unsorted_dates_rejected(self):
+        shuffled = self.df.sample(frac=1.0, random_state=3).reset_index(drop=True)
+        with self.assertRaises(ValueError):
+            split_dataset.dataset_train_test_split(shuffled)
+
+    def test_split_shapes_and_order(self):
+        (scaler_x, scaler_y, x_train, x_val, x_test,
+         y_train, y_val, y_test, x_predictions) = \
+            split_dataset.dataset_train_test_split(
+                self.df.copy(), test_size=0.10, validation_size=0.20
+            )
+
+        n_input = len(self.df)
+        forecast_out = int(np.ceil(0.05 * n_input))
+        n_model_rows = len(x_train) + len(x_val) + len(x_test)
+
+        # All non-reserved rows with a known target end up in the split
+        self.assertEqual(n_model_rows, n_input - forecast_out)
+        self.assertEqual(len(x_predictions), forecast_out)
+
+        # x/y lengths must agree per subset
+        self.assertEqual(len(x_train), len(y_train))
+        self.assertEqual(len(x_val), len(y_val))
+        self.assertEqual(len(x_test), len(y_test))
+
+        # Chronological split: train is the largest and earliest block
+        self.assertGreater(len(x_train), len(x_val))
+        self.assertGreater(len(x_val), len(x_test))
+
+    def test_scaler_fit_on_train_only(self):
+        """Scaled training features must span [0, 1]; val/test may exceed it."""
+        (scaler_x, scaler_y, x_train, x_val, x_test,
+         *_unused) = split_dataset.dataset_train_test_split(self.df.copy())
+
+        x_train_arr = np.asarray(x_train)
+        self.assertAlmostEqual(float(np.nanmin(x_train_arr)), 0.0, places=6)
+        self.assertAlmostEqual(float(np.nanmax(x_train_arr)), 1.0, places=6)
+
+
+if __name__ == "__main__":
+    unittest.main()
